@@ -1,0 +1,698 @@
+---
+title: "Series temporales"
+author: "Alvaro Herreruela"
+date: "15/4/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE,message=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readxl)
+library(zoo)
+library(forecast)
+library(tseries)
+library(MASS)
+library(forecast)
+library(lmtest)
+library(caschrono)
+library(lubridate)
+library(fastDummies)
+library(timeDate)
+library(tsoutliers)
+library(ModelMetrics)
+
+```
+
+## Limpieza y selección de variables
+
+En un primer lugar quitaremos los números del nombre de las columnas y asignaremos el nombre 'fecha' a la primera columna. A continuación, ordenaremos la variable fecha para poder transformarla en tipo fecha. Por último, seleccionaremos las columnas que hacen referencia a las provincias del País Vasco, y crearemos una columna 'total' que recogerá el total de hipotecas de la comunidad autónoma elegida.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+hipotecas <- read_excel("C:/Users/aherreruela/Desktop/Análisis de series temporales/202103_SeriesTemporales_materialPráctico/data/Hipotecas.xlsx")
+
+
+names(hipotecas) <- gsub('\\d','',names(hipotecas))
+names(hipotecas) <- gsub('^ ','',names(hipotecas))
+names(hipotecas)[1] <- 'fecha'
+
+
+hipotecas_pv <- hipotecas[,c(1,3,22,50)]
+hipotecas_pv$fecha <- gsub('M','-',hipotecas_pv$fecha)
+hipotecas_pv$fecha <- read.zoo(text = hipotecas_pv$fecha, FUN = as.yearmon)
+hipotecas_pv$fecha <- as.Date(time(hipotecas_pv$fecha))
+hipotecas_pv$total <- hipotecas_pv$Álava + hipotecas_pv$Vizcaya + hipotecas_pv$Gipuzkoa
+
+
+str(hipotecas_pv)
+summary(hipotecas_pv)
+head(hipotecas_pv)
+tail(hipotecas_pv)
+```
+
+## Análisis Genérico
+
+El gráfico representa el número de hipotecas por meses del año que hay en el País Vasco. Se puede observar como los primeros años hay un indice muy alto en la concesión de hipotecas debido a la burbuja inmobiliaria de esos años y como a partir del estallido de la burbuja se produce una caída drástica en el número de hipotecas. Podemos ver que no es estacionario ni en media ni en varianza ya que los datos no muestran ni media ni varianza 0.
+
+Lo más prudente sería coger los datos de después de la burbuja para no introducir datos poco representativos a los modelos. Haciendo varias pruebas he decidido dejar todos los datos porque con solo los de 2014 se ajusta un ARIMA de manera muy sencilla y el propósito de este trabajo es que se entienda que puedo ajustar cualquier tipo de serie temporal con los conocimientos adquiridos.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+ggplot(aes(x= fecha, y = total), data = hipotecas_pv) + geom_line(color = '#d84519') + 
+  xlab('FECHA') + ylab('total') + scale_x_date(date_breaks = '12 months', date_labels = "%y-%m-%d")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+hipotecas_pv.ts <- ts(hipotecas_pv$total, frequency=12)
+
+
+desc <- decompose(hipotecas_pv.ts)
+plot(stl(hipotecas_pv.ts, s.window = "periodic"))
+```
+
+Si seleccionamos los datos a partir del 2014, se puede analizar una tendencia creciente con algunos picos, debido a la inestabilidad de estos años, y una estacionalidad anual (cada 12 meses).
+
+Para realizar la modelación y posteriormente la predicción, utilizaremos los años desde 2003 hasta 2018 como train y el 2019 como test. 
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+hipotecas_pv2 <- hipotecas_pv %>% filter(fecha > '2014-01-01')
+
+ggplot(aes(x= fecha, y = total), data = hipotecas_pv2) + geom_line(color = '#d84519') +
+  xlab('FECHA') + ylab('total') + scale_x_date(date_breaks = '12 months', date_labels = "%y-%m-%d")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+hipotecas_pv <- hipotecas_pv[,c(1,5)]
+
+hipotecas_pv2.ts <- ts(hipotecas_pv2$total, frequency=12)
+
+
+desc <- decompose(hipotecas_pv2.ts)
+plot(stl(hipotecas_pv2.ts, s.window = "periodic"))
+
+hipotecas_pv.train <- subset(hipotecas_pv,(fecha>= "2003-01-01") & (fecha<="2018-12-31"))
+hipotecas_pv.train.ts <- as.ts(hipotecas_pv.train$total, frequency = 12)
+
+hipotecas_pv.validate <- subset(hipotecas_pv, (fecha>="2019-01-01") & (fecha<="2019-12-31"))
+hipotecas_pv.validate.ts <- as.ts(hipotecas_pv.validate$total, frequency=12)
+```
+
+## Análisis de Estacionariedad
+
+Analizaremos en primer lugar si es estacionaria en media, para así diferenciar la serie. Para ello, utilizaremos el test de Dickey-Fuller, que es un test de raices unitarias donde se ve si las raíces están fuera del círculo unidad. Si el p-valor es pequeño rechazo que phi es 1 por lo tanto no hay que diferenciar, de lo contrario si acepto, lo mismo debería diferenciar (no siempre acierta). En este caso como el p-valor es mayor que 0.05 por lo que habría que diferenciar.Aun así, ajustaremos la diferencia más adelante, cuando ajustemos los modelos.
+
+Para la estacionaridad en varianza, nos fijaremos en si el AIC es menor con aplicando el logaritmo o no aplicando nada. Utilizaremos el box_cox, donde se eleva la serie a un lambda para amortiguar diferencias. Para comprobar esto, haremos lambda de 1/2 que es hacer la raíz cuadrada, un lambda 0 que es aplicar el logaritmo, un lambda 1 que es no hacer nada y un lambda igual a -1 que seria hacer la inversa. Como el mejor lambda es 0.65 y lo más cercano sería una transformación tomando la raíz cuadrada, haremos la raíz cuadrada de nuestra variable objetivo.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+adf.test(hipotecas_pv.train.ts, alternative="stationary", k=12)
+
+box_cox <- boxcox(total ~ fecha,
+                  data = hipotecas_pv.train,
+                  lambda = c(-1,0,0.5, 1))
+
+lambda <- box_cox$x[which.max(box_cox$y)]
+lambda
+
+plot.ts(hipotecas_pv.train.ts)
+plot.ts(sqrt(hipotecas_pv.train.ts))
+
+hipotecas_pv.train$sqrt_target = sqrt(hipotecas_pv.train$total)
+hipotecas_pv.validate$sqrt_target  = sqrt(hipotecas_pv.validate$total)
+hipotecas_pv.train.ts <- as.ts(hipotecas_pv.train$sqrt_target, frequency = 12)
+hipotecas_pv.validate.ts <- as.ts(hipotecas_pv.validate$sqrt_target, frequency=12)
+```
+
+## Ajute de Frecuencia Simple y Parcial
+
+Si hacemos el gráfico de correlación simple podemos observar como se salen infinitas autocorrelaciones. Para poder ajustar un modelo ARIMA deberemos fijarnos en este caso en el gráfico de correlación parcial. Se puede observar como la autocorrelación parcial más significativa es la primera, es por eso que ajustaremos un AR(1). Si hacemos el intervalo de confianza con la estimación y la desviación típica de la estimación, no se incluye el 0, lo que hace que nuestro modelo hasta ahora sea válido.
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+acf(hipotecas_pv.train.ts, lag.max =12, xlab = "Retardo",
+    main= "Funci?n de autocorrelaci?n simple")
+
+
+pacf(hipotecas_pv.train.ts, lag.max = 12, xlab = "Retardo",
+     main = "Funci?n de autocorrelaci?n parcial")
+
+
+ajuste1 <- Arima(hipotecas_pv.train.ts,
+                 order = c(1,0,0),
+                 method = "ML")
+print(ajuste1)
+```
+
+De una manera más visual podemos obtener el p-valor, que al ser pequeño, nos indica lo mismo.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+coeftest(ajuste1)
+```
+
+Se puede analizar que en este primer ajuste tampoco existe multicolinealidad.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+cor.arma(ajuste1)
+```
+
+Los p-valores de todos los horizontes temporales son 0 lo que hace que rechacemos que las autocorrelaciones de las bandas sean 0, por lo tanto todavía debemos ajustar más nuestro modelo para que aparezca el ruido blanco
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+Box.test.2(residuals(ajuste1),
+           nlag = c(6,12,18,24,30,36,42,48),
+           type="Ljung-Box")
+
+graphics.off()
+
+acf(ajuste1$residuals, lag.max = 12, xlab = "Retardo", main="")
+pacf(ajuste1$residuals, lag.max = 12, xlab = "Retardo", main="")
+
+```
+Analizando los residuos nos da una idea de que existe una estacionalidad en aquellos meses que son multiplos de 4. Es por eso que ajustaremos un SAR dándole una temporalidad cada 4 meses. En este segundo ajuste se puede ver como el intervalo de confianza no alcanza el 0. Confirmamos la validez del nuevo ajuste viendo que el coeficiente es representativo.
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+ajuste2 <- Arima(hipotecas_pv.train.ts,
+                 order = c(1,0,0),
+                 seasonal = list(order = c(1,0,0), period = 4),
+                 method = "ML")
+ajuste2
+print('------------------------------')
+coeftest(ajuste2)
+```
+
+Aunque se queda muy cerca, sigue sin existir multicolinealidad, y como le vamos a hacer más ajustes a la serie probablemente baje la correlación de las variables. 
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+cor.arma(ajuste2)
+```
+
+El test de ruido blanco aun no nos está dando buenos resultados ya que los p-valores siguen siendo 0. Aun así, hemos mejorado con respecto al anterior ya que por lo menos con una temporalidad de 6 meses empieza a aparecer el ruido blanco.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+Box.test.2(residuals(ajuste2),
+           nlag = c(6,12,18,24,30,36,42,48),
+           type="Ljung-Box")
+
+acf(ajuste2$residuals, lag.max=12, xlab="Retardo", main="")
+pacf(ajuste2$residuals, lag.max = 12, xlab = "Retardo", main="")
+```
+
+Como sigue habiendo una diferencia estacional en 4 meses, vamos a ajustar un modelo SARIMA donde, en la parcial, Q depende de la periodicidad 4. En este ajuste el SAR se queda muy cercano a 1 por lo tanto vamos a tener que diferenciar en el siguiente ajuste ya que el AR(4), se ha transformado en una diferencia. Es por eso que ajustaremos la I en el próximo ajuste
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+ajuste3 <- Arima(hipotecas_pv.train.ts,
+                 order = c(1,0,0),
+                 seasonal = list(order = c(1,0,1), period = 4),
+                 method = "ML")
+ajuste3
+print('------------------------------')
+coeftest(ajuste3)
+```
+
+Como podemos observar ha bajado la correlación de la variable sar1 con ar1 tal y como habíamos dicho anteriormente. Además, sigue sin haber un claro indicio de multicolinealidad aunque nos haya aparecido una correlación entre sma1 y ar1 un poco más alta de lo normal.
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+cor.arma(ajuste3)
+```
+
+Como hemos dicho anteriormente vamos a meter una diferencia en la parte estacional, ya que el intervalo de confianza del AR(4) se nos había ido a 1 indicandonos que el AR(4) se convierte en la diferencia. Incluiremos además el parámetro 'include.constant' para que el modelo entienda que la nueva diferencia es significativa. El p-valor de la diferencia es significativo y los estimadores no son cercanos a 1.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+ajuste4 <- Arima(hipotecas_pv.train.ts,
+                 order = c(1,0,0),
+                 seasonal = list(order = c(0,1,1), period = 4),
+                 include.constant = T,
+                 method = "ML")
+ajuste4
+print('------------------------------')
+coeftest(ajuste4)
+```
+
+Seguimos teniendo una correlación alta entre sma1 y ar1 pero no lo suficientemente significativa. Seguiré con el ajuste del modelo.
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+cor.arma(ajuste4)
+```
+
+Podemos observar que la autocorrelación de los residuos cuando es q = 3 y p=3 es muy alta y no permite que haya ruido blanco. Aún así, podemos observar que los p-valores de las temporalidades ya son mayores que 1
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+Box.test.2(residuals(ajuste4),
+           nlag = c(6,12,18,24,30,36,42,48),
+           type="Ljung-Box")
+
+graphics.off()
+
+acf(ajuste4$residuals, lag.max = 12, xlab = "Retardo", main="")
+pacf(ajuste4$residuals, lag.max = 12, xlab = "Retardo", main="")
+
+```
+La autocorrelación de la parte simple más significativa tiene que ver con un MA(3). Ajustaremos en la parte simple un MA(3) ya que no hay concepto de estacionariedad en la parte de media móvil, pero lo necesitamos para reducir el ruido blanco y cumplir la condición de invertibilidad para que la suma de los párametros valgan lo mismo y no se le de más importancia a los parámetros que temporlamente están más lejos. 
+
+En este último ajuste la diferencia no es significativa pero aun así la dejaremos porque en los ajustes anteriores nos ha servido para reducir la autocorrelación en los multiplos de 4. Además vemos que se cumple la condición de invertibilidad donde ningún MA es cercano a 1
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+ajuste5 <- Arima(hipotecas_pv.train.ts,
+                 order = c(1,0,3),
+                 seasonal = list(order = c(0,1,1), period = 4),
+                 include.constant = T,
+                 method = "ML")
+ajuste5
+print('------------------------------')
+coeftest(ajuste5)
+```
+
+
+Ya hemos ajustado el modelo al máximo y podemos ver que ya hay casi ruido blanco (se sale la autocorrelación del mes 12). No se puede meter un MA(12), porque habría muchos MA que no serían significativos lo que hace que mi modelo no sea explicable. Para mejorar esto, tendríamos que meter variables explicativas.
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+Box.test.2(residuals(ajuste5),
+           nlag = c(6,12,18,24,30,36,42,48),
+           type="Ljung-Box")
+
+graphics.off()
+
+acf(ajuste5$residuals, lag.max = 12, xlab = "Retardo", main="")
+pacf(ajuste5$residuals, lag.max = 12, xlab = "Retardo", main="")
+
+```
+## Introducción de variables explicativas
+Para conseguir el ruido blanco en el mes 12, he decidido meter la variable meses. Una vez creada la variable del 1 al 12 la he dummificado y he hecho la partición entre train y test.
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+calendario <- hipotecas_pv
+
+calendario$total <- sqrt(calendario$total)
+
+calendario$mes <- month(calendario$fecha)
+
+calendario <- dummy_cols(calendario, select_columns = 'mes',remove_selected_columns = TRUE)
+
+
+calendario.train <- subset(calendario,(fecha>= "2003-01-01") & (fecha<="2018-12-31"))
+calendario.train <- as.matrix(calendario.train[,2:ncol(calendario.train)])
+
+calendario.validate <- subset(calendario, (fecha>="2019-01-01") & (fecha<="2019-12-31"))
+calendario.validate <- as.matrix(calendario.validate[,2:ncol(calendario.validate)])
+
+ajuste5ConMeses <- Arima(hipotecas_pv.train.ts,
+                 order = c(1,0,3),
+                 seasonal = list(order = c(0,1,1), period = 4),
+                 include.constant = T,
+                 method = "ML",
+                  xreg = calendario.train[,2:9])
+ajuste5ConMeses
+print('-----------------------------------')
+coeftest(ajuste5ConMeses)
+```
+
+La variable explicativa consigue que tengamos ruido blanco en los primeros años pero hay meses que todavía no tienen.
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+Box.test.2(residuals(ajuste5ConMeses),
+           nlag = c(6,12,18,24,30,36,42,48),
+           type="Ljung-Box")
+
+acf(ajuste5ConMeses$residuals, lag.max=12, xlab="Retardo", main="")
+pacf(ajuste5ConMeses$residuals, lag.max=12, xlab="Retardo", main="")
+
+```
+
+Vamos a hacer una última prueba introduciendoles otras variables como por ejemplo festivos y bisiestos. Introduciéndole estas últimas variables, podemos observar más ruido blanco ya que los p-valores aumentan en aquellos meses que eran más bajos.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+calculoExplicativasCalendario <- function(variableFecha, domingoYFestivosJuntos){
+  
+  if (month(max(variableFecha)) %in% c(1,3,5,7,8,10,12)) {
+    diasHastaFinMes <- 30
+  } else if (month(max(variableFecha)) %in% c(4,6,9,11)) {
+    diasHastaFinMes <- 29
+  } else if (year(max(variableFecha))%%4==0) {
+    diasHastaFinMes <- 28
+  } else {diasHastaFinMes <- 27}
+  
+  todasLasFechas <- data.frame(fechas=seq(min(variableFecha),
+                                          max(variableFecha)+diasHastaFinMes,
+                                          by="days"))
+
+  
+  domingoResurrecion <- as.Date(Easter(year(min(variableFecha)):year(max(variableFecha))))
+  lunesPascua <- domingoResurrecion+1
+  sabadoSanto <- domingoResurrecion-1
+  viernesSanto <- domingoResurrecion-2
+  juevesSanto <- domingoResurrecion-3
+  
+
+  semanaSanta <- sort(c(juevesSanto, viernesSanto, sabadoSanto, domingoResurrecion, lunesPascua))
+  
+
+  semanaSanta <- data.frame(fechas=semanaSanta, semanaSanta=rep(1,length(semanaSanta)))
+  
+
+  todasLasFechas_2 <- merge(x = todasLasFechas, y = semanaSanta, by = "fechas", all.x = TRUE)
+  
+
+  todasLasFechas_2$semanaSanta[is.na(todasLasFechas_2$semanaSanta)] <- 0
+  
+
+  
+  calendario <- todasLasFechas
+  
+  calendario$diaSemana <- as.factor(wday(calendario$fecha))
+  calendario$diaMes <- as.factor(day(calendario$fecha))
+  calendario$mes <- as.factor(month(calendario$fecha))
+  calendario$anyo <- as.factor(year(calendario$fecha))
+  
+  calendario$p_01ene <- ifelse(calendario$diaMes==1 & calendario$mes==1, 1, 0)
+  calendario$p_06ene <- ifelse(calendario$diaMes==6 & calendario$mes==1, 1, 0)
+  calendario$p_19mar <- ifelse(calendario$diaMes==19 & calendario$mes==3, 1, 0)
+  calendario$p_01may <- ifelse(calendario$diaMes==1 & calendario$mes==5, 1, 0)
+  calendario$p_15ago <- ifelse(calendario$diaMes==15 & calendario$mes==8, 1, 0)
+  calendario$p_12oct <- ifelse(calendario$diaMes==12 & calendario$mes==10,1, 0)
+  calendario$p_01nov <- ifelse(calendario$diaMes==1 & calendario$mes==11, 1 ,0)
+  calendario$p_06dic <- ifelse(calendario$diaMes==6 & calendario$mes==12, 1 ,0)
+  calendario$p_08dic <- ifelse(calendario$diaMes==8 & calendario$mes==12, 1 ,0)
+  calendario$p_25dic <- ifelse(calendario$diaMes==25 & calendario$mes==12, 1 ,0)
+  
+  calendario$festivo <- rowSums(subset(calendario, select=p_01ene:p_25dic))
+  
+  
+  if (domingoYFestivosJuntos==0){
+    
+    calendario$sabado <- ifelse(calendario$diaSemana==7, 1 ,0)
+    calendario$domingo <- ifelse(calendario$diaSemana==1, 1 ,0)
+    
+    calendario$laborable <- 1-calendario$sabado-calendario$domingo
+    
+  } else {
+    
+    calendario$sabado <- ifelse(calendario$diaSemana==7, 1 ,0)
+    calendario$domingo <- ifelse(calendario$diaSemana==1, 1 ,0)
+
+    calendario$domingo <- ifelse(calendario$domingo==1 | calendario$festivo==1, 1 ,0)
+    
+
+    calendario$laborable <- 1-calendario$sabado-calendario$domingo    
+  }
+  
+  
+  
+  calendario_2 <- calendario[, c("fechas", "mes", "anyo", "sabado", "domingo", "laborable", "festivo")]
+  
+  todasLasFechasFinal <- merge(x = todasLasFechas_2, y = calendario_2,
+                               by = "fechas", all.x = TRUE)
+  
+  # Agregamos la serie a nivel a?o-mes
+  
+  calendarioAnyoMes <- aggregate(todasLasFechasFinal[,c("sabado","domingo",
+                                                        "laborable", "semanaSanta", "festivo")],
+                                 by=list(mes=todasLasFechasFinal$mes,
+                                         anyo=todasLasFechasFinal$anyo),
+                                 "sum")
+  
+
+  
+  calendarioAnyoMes$dt <- calendarioAnyoMes$laborable-(5/2)*(calendarioAnyoMes$sabado+calendarioAnyoMes$domingo)
+  
+  
+  calendarioAnyoMes$anyoNum <- as.numeric(levels(calendarioAnyoMes$anyo))[calendarioAnyoMes$anyo]
+  
+  calendarioAnyoMes$bisiesto <- ifelse(calendarioAnyoMes$mes==2 &(calendarioAnyoMes$anyoNum %% 4)==0, 1 ,0)
+  
+  
+
+  
+  if (domingoYFestivosJuntos==0){
+    explicativasCalendario <- cbind(fecha=variableFecha, calendarioAnyoMes[, c("semanaSanta", "dt", "bisiesto", "festivo")])
+  } else {
+    explicativasCalendario <- cbind(fecha=variableFecha, calendarioAnyoMes[, c("semanaSanta", "dt", "bisiesto")])
+  }
+  
+  return(explicativasCalendario)
+  
+}
+
+
+explicativasCalendarioTrain <- calculoExplicativasCalendario(hipotecas_pv.train$fecha,domingoYFestivosJuntos=0)
+
+calendarioTrain <- 
+  as.matrix(
+    explicativasCalendarioTrain[,c("semanaSanta", "dt", "bisiesto")]
+    )
+
+ajuste5ConFestivos <- Arima(hipotecas_pv.train.ts,
+                 order = c(1,0,3),
+                 seasonal = list(order = c(0,1,1), period = 4),
+                 include.constant = T,
+                 method = "ML",
+                  xreg = calendarioTrain)
+
+coeftest(ajuste5ConFestivos)
+
+
+Box.test.2(residuals(ajuste5ConFestivos),
+           nlag = c(6,12,18,24,30,36,42,48),
+           type="Ljung-Box")
+
+acf(ajuste5ConFestivos$residuals, lag.max=12, xlab="Retardo", main="")
+pacf(ajuste5ConFestivos$residuals, lag.max=12, xlab="Retardo", main="")
+```
+
+## Ajuste de outliers
+
+Al principio habíamos analizado el impacto de la burbuja sobre la concesión de hipotecas. Lo más remarcable es un puslo puntual en febrero de 2010 y 2015 aunque también hay un cambio temporal en julio de 2016  
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+listaOutliersTrain <- locate.outliers(ajuste5ConMeses$residuals,
+                                      pars = coefs2poly(ajuste5ConMeses),
+                                      types = c("AO", "LS", "TC"),cval=3)
+
+listaOutliersTrain$abststat=abs(listaOutliersTrain$tstat)
+
+hipotecas_pv.train$ind <- as.numeric(rownames(hipotecas_pv.train))
+listaOutliersTrainFecha <- merge(listaOutliersTrain, hipotecas_pv.train[,c("ind", "fecha")], by = "ind")
+
+arrange(listaOutliersTrainFecha,desc(listaOutliersTrainFecha$abststat))
+```
+
+Si introducimos los ouliers como nuevas variables en nuestro modelo, podemos analizar que estas nuevas variables son muy significativas.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+outliersTrain <- outliers(c('AO','AO',"TC"), c(146,86,163))
+outliersVariablesTrain <- outliers.effects(outliersTrain, length(ajuste5ConMeses$residuals))
+calendarioMasOuliers <- as.matrix(cbind(calendarioTrain,outliersVariablesTrain))
+
+ajuste5ConFestivosMasOuliers <- Arima(hipotecas_pv.train.ts,
+                 order = c(1,0,3),
+                 seasonal = list(order = c(0,1,1), period = 4),
+                 method = "ML",
+                  xreg = calendarioMasOuliers)
+
+coeftest(ajuste5ConFestivosMasOuliers)
+
+```
+
+Por último, se puede apreciar como aparece ruido blanco en todos los momentos del tiempo
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+Box.test.2(residuals(ajuste5ConFestivosMasOuliers),
+           nlag = c(6,12,18,24,30,36,42,48),
+           type="Ljung-Box")
+
+acf(ajuste5ConFestivosMasOuliers$residuals, lag.max=12, xlab="Retardo", main="")
+pacf(ajuste5ConFestivosMasOuliers$residuals, lag.max=12, xlab="Retardo", main="")
+```
+
+## Predicción
+
+Porcederemos ahora a la predicción del set de validación. Para ello, es necesario colocar el calendario como lo teníamos en train, donde introduciamos la Semana Santa, la variable dt y bisiestos. Una vez ordenado el set de datos porcedemos a su predicción. Cuando predecimos es necesario elevar al cuadrado las predicciones porque habíamos hecho la estacionariedad en varianza utilizando la raíz cuadrada.
+
+Si graficamos las predicciones podemos observar que no quedan muy lejos de la realidad.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+explicativasCalendarioTest <- calculoExplicativasCalendario(hipotecas_pv.validate$fecha,domingoYFestivosJuntos=0)
+calendarioTest <- as.matrix(explicativasCalendarioTest[,c("semanaSanta", "dt", "bisiesto")])
+
+outliersVariablesTest <- outliersVariablesTrain[181:192,]
+
+calendarioMasOutliersTest <- as.matrix(cbind(calendarioTest,outliersVariablesTest))
+
+
+prediccion <- as.data.frame(predict(ajuste5ConFestivosMasOuliers, n.ahead=12,
+                                    newxreg=calendarioMasOutliersTest))
+
+U <- (prediccion$pred + 2*prediccion$se)^2
+L <- (prediccion$pred - 2*prediccion$se)^2
+
+hipotecas_pv.pred <- data.frame(fecha = hipotecas_pv.validate$fecha, Prediccion = (prediccion$pred+0.5*prediccion$se)^2,
+                         LimSup = U, LimInf =L)
+
+hipotecas_pv.real.pred <- merge(hipotecas_pv[,c("fecha","total")], hipotecas_pv.pred, by = "fecha", all.x = T)
+
+
+grafico1 <- ggplot(data = hipotecas_pv.real.pred) +
+  geom_line(aes(x= fecha, y = total), color = 'steelblue',
+            alpha = 0.8, size = 1) +
+  geom_line(aes(x= fecha, y = Prediccion), color = 'darkred',
+            alpha = 0.9, linetype = 2, size = 1) + 
+  xlab('FECHA') + ylab('Hipotecas')
+
+
+print(paste0('RMSE:', rmse(actual = hipotecas_pv.real.pred[193:204,'total'],predicted =hipotecas_pv.real.pred[193:204,'Prediccion'])))
+grafico1
+
+```
+
+Lo importante es ver los intevarlos de confianza que deja una banda muy amplia entre el máximo y el míninimo, lo que hará que nuestro modelo puede fallar mucho si predecimos nuevos datos.
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+hipotecas_pv.real.pred$target[hipotecas_pv.real.pred$fecha>as.Date('2018-12-01',format='%Y-%m-%d')] <- NA
+
+grafico2 <- ggplot(data = hipotecas_pv.real.pred) +
+  geom_line(aes(x= fecha, y = total), color = 'steelblue',
+            alpha = 0.8, size = 0.8) +
+  geom_line(aes(x= fecha, y = Prediccion), color = 'darkred',
+            size = 1)   +
+  geom_line(aes(x= fecha, y = LimSup), color = 'orange',
+            size = 1)  +
+  geom_line(aes(x= fecha, y = LimInf), color = 'orange',
+            size = 1) +
+  xlab('FECHA') + ylab('Matriculaciones')
+
+grafico2
+
+```
+
+## Ajuste Automático
+
+#### Álava
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+hipotecas_pv <- hipotecas[,c(1,3,22,50)]
+hipotecas_pv$fecha <- gsub('M','-',hipotecas_pv$fecha)
+hipotecas_pv$fecha <- read.zoo(text = hipotecas_pv$fecha, FUN = as.yearmon)
+hipotecas_pv$fecha <- as.Date(time(hipotecas_pv$fecha))
+hipotecas_pv$total <- hipotecas_pv$Álava + hipotecas_pv$Vizcaya + hipotecas_pv$Gipuzkoa
+
+alava <- hipotecas_pv[,c(1,2)]
+
+alava.train <- subset(alava,(fecha>= "2003-01-01") & (fecha<="2018-12-31"))
+alava.train.ts <- as.ts(alava.train$Álava, frequency = 12)
+alava.train$sqrt_target = sqrt(alava.train$Álava)
+alava.train.ts <- as.ts(alava.train$sqrt_target, frequency = 12)
+alava.validate <- subset(alava, (fecha>="2019-01-01") & (fecha<="2019-12-31"))
+alava.validate.ts <- as.ts(alava.validate$Álava, frequency=12)
+
+
+ajusteAutomaticoalava <- auto.arima(alava.train.ts,
+                               max.d=3, max.D=3,
+                               max.p=3, max.P=3,
+                               max.q=3, max.Q=3, 
+                               seasonal=TRUE,
+                               ic="aic",
+                               allowdrift=FALSE,
+                               stepwise=TRUE,
+                               xreg=calendarioMasOuliers)
+
+coeftest(ajusteAutomaticoalava)
+
+
+Box.test.2(residuals(ajusteAutomaticoalava),
+nlag = c(6,12,18,24,30,36,42,48),
+type="Ljung-Box")
+
+prediccion_alava <- as.data.frame(predict(ajusteAutomaticoalava, n.ahead=12,newxreg = calendarioMasOutliersTest))
+
+
+alava.pred <- data.frame(fecha = alava.validate$fecha, Prediccion_alava = (prediccion_alava$pred+0.5*prediccion_alava$se)^2)
+
+```
+
+#### Guipuzkoa
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+guipuzkoa <- hipotecas_pv[,c(1,3)]
+
+guipuzkoa.train <- subset(guipuzkoa,(fecha>= "2003-01-01") & (fecha<="2018-12-31"))
+guipuzkoa.train.ts <- as.ts(guipuzkoa.train$Gipuzkoa, frequency = 12)
+guipuzkoa.train$sqrt_target = sqrt(guipuzkoa.train$Gipuzkoa)
+guipuzkoa.train.ts <- as.ts(guipuzkoa.train$sqrt_target, frequency = 12)
+guipuzkoa.validate <- subset(guipuzkoa, (fecha>="2019-01-01") & (fecha<="2019-12-31"))
+guipuzkoa.validate.ts <- as.ts(guipuzkoa.validate$Gipuzkoa, frequency=12)
+
+
+ajusteAutomaticoguipuzkoa <- auto.arima(guipuzkoa.train.ts,
+                               max.d=3, max.D=3,
+                               max.p=3, max.P=3,
+                               max.q=3, max.Q=3, 
+                               seasonal=TRUE,
+                               ic="aic",
+                               allowdrift=FALSE,
+                               stepwise=TRUE,
+                               xreg=calendarioMasOuliers)
+
+coeftest(ajusteAutomaticoguipuzkoa)
+
+
+Box.test.2(residuals(ajusteAutomaticoguipuzkoa),
+nlag = c(6,12,18,24,30,36,42,48),
+type="Ljung-Box")
+
+prediccion_guipuzkoa <- as.data.frame(predict(ajusteAutomaticoguipuzkoa, n.ahead=12,newxreg = calendarioMasOutliersTest))
+
+
+guipuzkoa.pred <- data.frame(fecha = guipuzkoa.validate$fecha, Prediccion_guipuzkoa = (prediccion_guipuzkoa$pred+0.5*prediccion_guipuzkoa$se)^2)
+
+
+```
+
+#### Vizcaya
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+
+vizcaya <- hipotecas_pv[,c(1,4)]
+
+vizcaya.train <- subset(vizcaya,(fecha>= "2003-01-01") & (fecha<="2018-12-31"))
+vizcaya.train.ts <- as.ts(vizcaya.train$Vizcaya, frequency = 12)
+vizcaya.train$sqrt_target = sqrt(vizcaya.train$Vizcaya)
+vizcaya.train.ts <- as.ts(vizcaya.train$sqrt_target, frequency = 12)
+vizcaya.validate <- subset(vizcaya, (fecha>="2019-01-01") & (fecha<="2019-12-31"))
+vizcaya.validate.ts <- as.ts(vizcaya.validate$Vizcaya, frequency=12)
+
+
+ajusteAutomaticovizcaya <- auto.arima(vizcaya.train.ts,
+                               max.d=3, max.D=3,
+                               max.p=3, max.P=3,
+                               max.q=3, max.Q=3, 
+                               seasonal=TRUE,
+                               ic="aic",
+                               allowdrift=FALSE,
+                               stepwise=TRUE,
+                               xreg=calendarioMasOuliers)
+
+coeftest(ajusteAutomaticovizcaya)
+
+
+Box.test.2(residuals(ajusteAutomaticovizcaya),
+nlag = c(6,12,18,24,30,36,42,48),
+type="Ljung-Box")
+
+prediccion_vizcaya <- as.data.frame(predict(ajusteAutomaticovizcaya, n.ahead=12,newxreg = calendarioMasOutliersTest))
+
+
+vizcaya.pred <- data.frame(fecha = vizcaya.validate$fecha, Prediccion_vizcaya = (prediccion_vizcaya$pred+0.5*prediccion_vizcaya$se)^2)
+
+
+```
+
+#### Total
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE}
+
+total_pv.preds <- merge(alava.pred[,c("fecha","Prediccion_alava")], guipuzkoa.pred, by = "fecha", all.x = T) %>% merge( vizcaya.pred, by = "fecha", all.x = T)
+
+total_pv.preds$sum <- total_pv.preds$Prediccion_alava + total_pv.preds$Prediccion_guipuzkoa +total_pv.preds$Prediccion_vizcaya
+
+total_preds <- total_pv.preds[,c(1,5)]
+
+
+total_preds.real.pred <- merge(hipotecas_pv[,c("fecha","total")], total_preds, by = "fecha", all.x = T)
+
+
+grafico1 <- ggplot(data = total_preds.real.pred ) +
+  geom_line(aes(x= fecha, y = total), color = 'steelblue',
+            alpha = 0.8, size = 1) +
+  geom_line(aes(x= fecha, y = sum), color = 'darkred',
+            alpha = 0.9, linetype = 2, size = 1) + 
+  xlab('FECHA') + ylab('Hipotecas')
+
+
+print(paste0('RMSE:', rmse(actual = total_preds.real.pred[193:204,'total'],predicted =total_preds.real.pred[193:204,'sum'])))
+grafico1
+
+```
+
+## Conclusiones
+
+Al final nos ha dado mejores soluciones ajustar un modelo autoarima que haciéndolo manualmente. En ambos hemos introducido los ouliers y las variables de dt, Semana Santa y bisiestos. Hemos utilizado la métrica RMSE para comparar ambas predicciones y hay una diferencia de más de 20 entre una y otra, siendo mejor la predicción automática. Aún así, se ha conseguido más ruido blanco prediciendo de manera manual ya que los p-valores de los diferentes horizontes temporales son mayores que 0, mientras que prediciendo de manera automática por provincias se nos queda muy poco ruido blanco para cada horizonte temporal. Lo bueno del ajuste automático es que al tener la información desagregada por provincias puede ser más específico en los hiperparámetros que utiliza, por lo tanto si tengo muchas provincias en la comunidad autónoma seleccionada, va a predecir mejor un modelo autoarima. Aun así, si no hay muchas series temporales que analizar, sería mejor hacerlo manualmente.
+
